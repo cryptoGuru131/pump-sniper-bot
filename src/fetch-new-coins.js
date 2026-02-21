@@ -2,21 +2,59 @@
  * Pump.fun New Coin Fetcher
  * Uses Triton Dragon's Mouth gRPC to stream new token launches in real-time
  *
- * Set GRPC_ENDPOINT and GRPC_TOKEN in .env
- * Triton endpoint: https://api.rpcpool.com:443
+ * Docs: https://docs.triton.one/project-yellowstone/dragons-mouth-grpc-subscriptions
+ *
+ * Set in .env:
+ *   GRPC_ENDPOINT=<your-endpoint>   Get from Triton portal (customers.triton.one), NOT api.rpcpool.com
+ *   GRPC_TOKEN=<your-triton-token>
+ *   RPC_ENDPOINT=...  (optional, for slot timestamp / latency)
+ *
+ * Latency: Triton targets ≤50ms when your server has ≤50ms RTT to the endpoint.
+ * - Use YOUR endpoint from the Triton portal (GeoDNS routes to nearest region)
+ * - Deploy your bot in same region as Solana validators (e.g. AWS us-east-1, EU)
+ * - api.rpcpool.com is EU-only; if you're elsewhere, latency will be 100-200ms+
  */
 
 import "dotenv/config";
+import bs58 from "bs58";
 import Client from "@triton-one/yellowstone-grpc";
 import { CommitmentLevel } from "@triton-one/yellowstone-grpc";
-import { PublicKey } from "@solana/web3.js";
-import { PUMP_PROGRAM_ID, isCreateInstruction } from "./constants.js";
+import { Connection, PublicKey } from "@solana/web3.js";
+import {
+  PUMP_PROGRAM_ID,
+  PUMP_FUN_MINT_AUTHORITY,
+  CREATE_DISCRIMINATOR,
+  CREATE_V2_DISCRIMINATOR,
+} from "./constants.js";
 
-const GRPC_ENDPOINT = process.env.GRPC_ENDPOINT || "https://api.rpcpool.com:443";
+// Create instruction accounts (from Pump.fun IDL): 0=mint, 1=mintAuthority, 2=bondingCurve, ...
+const ACCOUNTS_TO_INCLUDE = [{ name: "mint", index: 0 }];
+const INSTRUCTION_DISCRIMINATORS = [CREATE_DISCRIMINATOR, CREATE_V2_DISCRIMINATOR];
+
+// Endpoint: https://api.rpcpool.com:443 (Triton public gRPC)
+function normalizeEndpoint(raw) {
+  const s = (raw || "https://api.rpcpool.com:443").trim();
+  if (!s) return "https://api.rpcpool.com:443";
+  let url = s;
+  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+    url = "https://" + url;
+  }
+  url = url.replace(/\/$/, "");
+  try {
+    const u = new URL(url);
+    if (!u.port) u.port = "443";
+    return u.toString();
+  } catch {
+    return url.includes(":443") ? url : url + ":443";
+  }
+}
+
+const GRPC_ENDPOINT = normalizeEndpoint(process.env.GRPC_ENDPOINT);
 const GRPC_TOKEN = process.env.GRPC_TOKEN || "";
+const RPC_ENDPOINT = process.env.RPC_ENDPOINT || "https://api.mainnet-beta.solana.com";
 
 if (!GRPC_TOKEN) {
-  console.warn("⚠️  GRPC_TOKEN not set. Set it in .env for Triton authentication.");
+  console.warn("⚠️  GRPC_TOKEN not set. Get your token at https://triton.one");
 }
 
 /**
@@ -42,79 +80,162 @@ function getAccountKeys(transaction, meta) {
 }
 
 /**
- * Extract new mint from a pump.fun create transaction
+ * Read account index at position N from instruction.accounts.
+ * QuickNode uses instruction.accounts[account.index] - direct index.
+ * Yellowstone may return raw [idx0, idx1, ...] (no length) or Solana wire [len, idx0, ...].
  */
-function extractNewMintFromTransaction(txInfo) {
-  const tx = txInfo?.transaction;
-  const meta = txInfo?.meta;
+function getAccountIndexAt(accounts, index) {
+  if (!accounts) return null;
+  if (Array.isArray(accounts)) {
+    return index < accounts.length ? accounts[index] : null;
+  }
+  const bytes = accounts;
+  if (index >= bytes.length) return null;
+  // Try direct index first (raw format). If that yields mint_authority for mint slot, try +1.
+  return bytes[index];
+}
 
-  if (!tx || !meta) return null;
-  if (meta.err) return null; // Skip failed txs
+/**
+ * Check if instruction data matches one of the create discriminators (QuickNode pattern)
+ */
+function checkInstructionMatchesInstructionHandlers(instruction, discriminators) {
+  if (!instruction?.data || instruction.data.length < 8) return false;
+  const disc = instruction.data.slice(0, 8);
+  return discriminators.some((d) => Buffer.from(d).equals(Buffer.from(disc)));
+}
 
-  const msg = tx.message;
-  if (!msg?.instructions?.length) return null;
+/**
+ * Map account names to base58 addresses (QuickNode pattern)
+ */
+function getAccountsByName(accountsToInclude, instruction, accountKeys) {
+  const result = {};
+  for (const { name, index } of accountsToInclude) {
+    const keyIdx = getAccountIndexAt(instruction.accounts, index);
+    if (keyIdx == null || keyIdx >= accountKeys.length) continue;
+    const key = accountKeys[keyIdx];
+    if (key) result[name] = key.toBase58();
+  }
+  return result;
+}
 
-  const accountKeys = getAccountKeys(tx, meta);
-  const pumpProgramId = new PublicKey(PUMP_PROGRAM_ID);
+/**
+ * Extract mint info from Yellowstone SubscribeUpdate (QuickNode guide pattern)
+ * @returns {{ mint: string, transaction: string, slot: number } | null}
+ */
+function getMintInfoFromUpdate(update, instructionDiscriminators, accountsToInclude) {
+  if (!update.filters?.includes("pumpFun")) return null;
 
-  for (const ix of msg.instructions) {
-    const programId = accountKeys[ix.programIdIndex];
-    if (!programId?.equals(pumpProgramId)) continue;
+  const txInfo = update.transaction?.transaction;
+  const transaction = txInfo?.transaction;
+  const message = transaction?.message;
+  const slot = update.transaction?.slot;
 
-    const data = ix.data && ix.data.length >= 8 ? ix.data : new Uint8Array(0);
-    if (!isCreateInstruction(data)) continue;
+  if (!transaction || !message || !slot) return null;
+  if (txInfo.meta?.err) return null; // Skip failed txs
 
-    // Create instruction: first account is the mint (writable, signer)
-    // accounts format: [compact_u16_length, idx0, idx1, ...] - first index after length
-    const accountsBytes = ix.accounts || new Uint8Array(0);
-    if (accountsBytes.length < 2) continue;
+  const accountKeys = getAccountKeys(transaction, txInfo.meta);
 
-    const mintIndex = accountsBytes[1]; // First account index (after 1-byte length)
-    const mintKey = accountKeys[mintIndex];
-    if (mintKey) {
-      return mintKey.toBase58();
-    }
+  // Find create instruction (top-level or inner)
+  const allInstructions = [
+    ...(message.instructions || []),
+    ...(txInfo.meta?.innerInstructions || []).flatMap((ii) => ii.instructions || []),
+  ];
+
+  for (const ix of allInstructions) {
+    if (!checkInstructionMatchesInstructionHandlers(ix, instructionDiscriminators)) continue;
+
+    const accountsByName = getAccountsByName(accountsToInclude, ix, accountKeys);
+    const mint = accountsByName.mint;
+    if (!mint || mint === PUMP_FUN_MINT_AUTHORITY) continue; // mint is never the authority
+
+    const sig = txInfo.signature
+      ? bs58.encode(Buffer.from(txInfo.signature))
+      : "unknown";
+
+    return {
+      mint,
+      transaction: sig,
+      slot: Number(slot),
+    };
   }
 
   return null;
 }
 
 async function main() {
+  console.log("Connecting to:", GRPC_ENDPOINT);
   const client = new Client(GRPC_ENDPOINT, GRPC_TOKEN, {
-    "grpc.max_receive_message_length": 100 * 1024 * 1024,
+    grpcMaxDecodingMessageSize: 64 * 1024 * 1024, // 64 MiB (per Triton sample)
   });
 
   await client.connect();
   const version = await client.getVersion();
   console.log("✅ Connected to Triton gRPC, version:", version || "unknown");
-  console.log("🔍 Listening for new pump.fun token launches...\n");
+  console.log("🔍 Listening for new pump.fun token launches...");
+  console.log("   Endpoint:", GRPC_ENDPOINT, "(use your Triton portal endpoint for lowest latency)");
+  console.log("   Tip: Run 'ping', (host from URL) to check RTT. Target ≤50ms for ~50ms gRPC latency.\n");
 
   const stream = await client.subscribe();
+  const rpcConnection = new Connection(RPC_ENDPOINT);
 
-  stream.on("data", (data) => {
-    // Handle transaction updates
-    if (data?.transaction?.transaction) {
-      const txInfo = data.transaction.transaction;
-      const slot = data.transaction.slot;
+  // Cache slot -> blockTime (Unix seconds) for latency measurement
+  const slotToBlockTime = new Map();
+  const latencySamples = [];
+  const LATENCY_SAMPLE_SIZE = 100;
 
-      const mint = extractNewMintFromTransaction(txInfo);
-      if (mint) {
-        const sig = txInfo.signature
-          ? Buffer.from(txInfo.signature).toString("base64")
-          : "unknown";
+  stream.on("data", async (data) => {
+    const arrivalMs = Date.now(); // Capture immediately - first line of handler
+    try {
+      // Cache block metadata for slot timestamp
+      if (data?.blockMeta?.slot != null && data?.blockMeta?.blockTime?.timestamp != null) {
+        slotToBlockTime.set(String(data.blockMeta.slot), Number(data.blockMeta.blockTime.timestamp));
+      }
+
+      const mintInfo = getMintInfoFromUpdate(
+        data,
+        INSTRUCTION_DISCRIMINATORS,
+        ACCOUNTS_TO_INCLUDE
+      );
+
+      if (mintInfo) {
+        let slotTimestamp = slotToBlockTime.get(String(mintInfo.slot));
+        if (slotTimestamp == null) {
+          // getBlockTime needs confirmed block; at PROCESSED we're ahead of RPC. Retry with short delays.
+          for (const delayMs of [0, 400, 800]) {
+            if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
+            try {
+              slotTimestamp = await rpcConnection.getBlockTime(mintInfo.slot);
+              if (slotTimestamp != null) break;
+            } catch {
+              // RPC may fail for very recent slots
+            }
+          }
+        }
+        const slotTimestampMs = slotTimestamp != null ? slotTimestamp * 1000 : null;
+
         console.log("🪙 NEW TOKEN DETECTED");
-        console.log("   Mint:", mint);
-        console.log("   Slot:", slot);
-        console.log("   Signature (base64):", sig);
-        console.log("   Pump.fun: https://pump.fun/" + mint);
+        console.log("   Mint:", mintInfo.mint);
+        console.log("   Slot:", mintInfo.slot);
+        console.log("   Slot timestamp:", slotTimestampMs != null ? new Date(slotTimestampMs).toISOString() : "N/A");
+        console.log("   Arrival timestamp:", new Date(arrivalMs).toISOString());
+        if (slotTimestampMs != null) {
+          const latencyMs = arrivalMs - slotTimestampMs;
+          latencySamples.push(latencyMs);
+          if (latencySamples.length > LATENCY_SAMPLE_SIZE) latencySamples.shift();
+          const avgLatency = latencySamples.reduce((a, b) => a + b, 0) / latencySamples.length;
+          console.log("   Latency (ms):", latencyMs);
+          console.log("   Avg latency (last", latencySamples.length, "samples):", Math.round(avgLatency), "ms");
+        }
+        console.log("   Transaction:", mintInfo.transaction);
+        console.log("   Pump.fun: https://pump.fun/" + mintInfo.mint);
         console.log("");
       }
+    } catch (err) {
+      console.error("Error processing update:", err?.message || err);
     }
 
-    // Handle pong (keepalive)
-    if (data?.pong) {
-      // Silent - connection alive
-    }
+    // Handle pong (keepalive) - silent
+    if (data?.pong) {}
   });
 
   stream.on("error", (err) => {
@@ -130,18 +251,18 @@ async function main() {
     slots: { slots: {} },
     accounts: {},
     transactions: {
-      pumpfun: {
+      pumpFun: {
         vote: false,
         failed: false,
-        accountInclude: [PUMP_PROGRAM_ID],
+        accountInclude: [],
         accountExclude: [],
-        accountRequired: [],
+        accountRequired: [PUMP_PROGRAM_ID, PUMP_FUN_MINT_AUTHORITY],
       },
     },
     transactionsStatus: {},
     entry: {},
     blocks: {},
-    blocksMeta: {},
+    blocksMeta: { meta: {} }, // For slot timestamp (blockTime) in latency measurement
     accountsDataSlice: [],
     commitment: CommitmentLevel.PROCESSED, // Fastest - intra-slot updates
   };
@@ -177,5 +298,10 @@ async function main() {
 
 main().catch((err) => {
   console.error("Fatal error:", err);
+  const msg = String(err?.message || err);
+  if (msg.includes("403") || msg.includes("Forbidden")) {
+    console.error("\n💡 403 Forbidden = invalid or missing Triton gRPC token.");
+    console.error("   Get your token at https://triton.one (Customers Portal → create token for gRPC).");
+  }
   process.exit(1);
 });
