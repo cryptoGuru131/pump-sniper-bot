@@ -1,25 +1,20 @@
 /**
  * Pump.fun New Coin Fetcher
- * Uses Triton Dragon's Mouth gRPC to stream new token launches in real-time
- *
- * Docs: https://docs.triton.one/project-yellowstone/dragons-mouth-grpc-subscriptions
+ * Uses Yellowstone gRPC (Triton / Helius Laserstream) to stream new token launches in real-time
  *
  * Set in .env:
- *   GRPC_ENDPOINT=<your-endpoint>   Get from Triton portal (customers.triton.one), NOT api.rpcpool.com
- *   GRPC_TOKEN=<your-triton-token>
- *   RPC_ENDPOINT=...  (optional, for slot timestamp / latency)
+ *   GRPC_ENDPOINT=<your-endpoint>   e.g. https://laserstream-mainnet-ewr.helius-rpc.com
+ *   GRPC_TOKEN=<your-grpc-token>
  *
- * Latency: Triton targets ≤50ms when your server has ≤50ms RTT to the endpoint.
- * - Use YOUR endpoint from the Triton portal (GeoDNS routes to nearest region)
- * - Deploy your bot in same region as Solana validators (e.g. AWS us-east-1, EU)
- * - api.rpcpool.com is EU-only; if you're elsewhere, latency will be 100-200ms+
+ * Latency: Uses created_at (when server created the message) for accurate gRPC latency.
+ * Target ≤50ms when co-located with the endpoint.
  */
 
 import "dotenv/config";
 import bs58 from "bs58";
 import Client from "@triton-one/yellowstone-grpc";
 import { CommitmentLevel } from "@triton-one/yellowstone-grpc";
-import { Connection, PublicKey } from "@solana/web3.js";
+import { PublicKey } from "@solana/web3.js";
 import {
   PUMP_PROGRAM_ID,
   PUMP_FUN_MINT_AUTHORITY,
@@ -31,10 +26,9 @@ import {
 const ACCOUNTS_TO_INCLUDE = [{ name: "mint", index: 0 }];
 const INSTRUCTION_DISCRIMINATORS = [CREATE_DISCRIMINATOR, CREATE_V2_DISCRIMINATOR];
 
-// Endpoint: https://api.rpcpool.com:443 (Triton public gRPC)
 function normalizeEndpoint(raw) {
-  const s = (raw || "https://api.rpcpool.com:443").trim();
-  if (!s) return "https://api.rpcpool.com:443";
+  const s = (raw || "https://laserstream-mainnet-ewr.helius-rpc.com").trim();
+  if (!s) return "https://laserstream-mainnet-ewr.helius-rpc.com";
   let url = s;
   if (!url.startsWith("http://") && !url.startsWith("https://")) {
     url = "https://" + url;
@@ -51,10 +45,9 @@ function normalizeEndpoint(raw) {
 
 const GRPC_ENDPOINT = normalizeEndpoint(process.env.GRPC_ENDPOINT);
 const GRPC_TOKEN = process.env.GRPC_TOKEN || "";
-const RPC_ENDPOINT = process.env.RPC_ENDPOINT || "https://api.mainnet-beta.solana.com";
 
 if (!GRPC_TOKEN) {
-  console.warn("⚠️  GRPC_TOKEN not set. Get your token at https://triton.one");
+  console.warn("⚠️  GRPC_TOKEN not set. Get your token from Triton or Helius dashboard.");
 }
 
 /**
@@ -176,20 +169,14 @@ async function main() {
   console.log("   Tip: Run 'ping', (host from URL) to check RTT. Target ≤50ms for ~50ms gRPC latency.\n");
 
   const stream = await client.subscribe();
-  const rpcConnection = new Connection(RPC_ENDPOINT);
-
-  // Cache slot -> blockTime (Unix seconds) for latency measurement
-  const slotToBlockTime = new Map();
   const latencySamples = [];
   const LATENCY_SAMPLE_SIZE = 100;
 
   stream.on("data", async (data) => {
     const arrivalMs = Date.now(); // Capture immediately - first line of handler
     try {
-      // Cache block metadata for slot timestamp
-      if (data?.blockMeta?.slot != null && data?.blockMeta?.blockTime?.timestamp != null) {
-        slotToBlockTime.set(String(data.blockMeta.slot), Number(data.blockMeta.blockTime.timestamp));
-      }
+      // created_at: when gRPC server created the message (accurate gRPC latency)
+      const createdAtMs = data?.createdAt ? new Date(data.createdAt).getTime() : null;
 
       const mintInfo = getMintInfoFromUpdate(
         data,
@@ -198,32 +185,19 @@ async function main() {
       );
 
       if (mintInfo) {
-        let slotTimestamp = slotToBlockTime.get(String(mintInfo.slot));
-        if (slotTimestamp == null) {
-          // getBlockTime needs confirmed block; at PROCESSED we're ahead of RPC. Retry with short delays.
-          for (const delayMs of [0, 400, 800]) {
-            if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
-            try {
-              slotTimestamp = await rpcConnection.getBlockTime(mintInfo.slot);
-              if (slotTimestamp != null) break;
-            } catch {
-              // RPC may fail for very recent slots
-            }
-          }
-        }
-        const slotTimestampMs = slotTimestamp != null ? slotTimestamp * 1000 : null;
-
         console.log("🪙 NEW TOKEN DETECTED");
         console.log("   Mint:", mintInfo.mint);
         console.log("   Slot:", mintInfo.slot);
-        console.log("   Slot timestamp:", slotTimestampMs != null ? new Date(slotTimestampMs).toISOString() : "N/A");
-        console.log("   Arrival timestamp:", new Date(arrivalMs).toISOString());
-        if (slotTimestampMs != null) {
-          const latencyMs = arrivalMs - slotTimestampMs;
+        if (createdAtMs != null) {
+          console.log("   Created at:", createdAtMs, "ms");
+        }
+        console.log("   Arrival:", arrivalMs, "ms");
+        if (createdAtMs != null) {
+          const latencyMs = arrivalMs - createdAtMs;
           latencySamples.push(latencyMs);
           if (latencySamples.length > LATENCY_SAMPLE_SIZE) latencySamples.shift();
           const avgLatency = latencySamples.reduce((a, b) => a + b, 0) / latencySamples.length;
-          console.log("   Latency (ms):", latencyMs);
+          console.log("   Latency (arrival - created_at):", latencyMs, "ms");
           console.log("   Avg latency (last", latencySamples.length, "samples):", Math.round(avgLatency), "ms");
         }
         console.log("   Transaction:", mintInfo.transaction);
@@ -262,7 +236,7 @@ async function main() {
     transactionsStatus: {},
     entry: {},
     blocks: {},
-    blocksMeta: { meta: {} }, // For slot timestamp (blockTime) in latency measurement
+    blocksMeta: {},
     accountsDataSlice: [],
     commitment: CommitmentLevel.PROCESSED, // Fastest - intra-slot updates
   };
