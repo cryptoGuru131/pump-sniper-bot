@@ -2,16 +2,22 @@
   "name": "pumpfun-sniper",
   "version": "1.0.0",
   "description": "Pump.fun new coin sniper using Triton gRPC",
+  "engines": { "node": ">=18.0.0" },
   "type": "module",
   "scripts": {
-    "start": "node src/fetch-new-coins.js",
-    "dev": "node --watch src/fetch-new-coins.js"
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js",
+    "fetch": "TRADING_ENABLED=false node src/index.js"
   },
   "dependencies": {
-    "bs58": "^4.0.1",
-    "@coral-xyz/anchor": "^0.30.1",
+    "@pump-fun/pump-sdk": "^1.28.0",
     "@solana/web3.js": "^1.95.0",
     "@triton-one/yellowstone-grpc": "^5.0.2",
+    "bn.js": "^5.2.3",
+    "bs58": "^4.0.1",
     "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
   }
 }

@@ -10,12 +10,3 @@ export const PUMP_FUN_MINT_AUTHORITY = "TSLvdd1pWpHVjahSpsvCXUbgwsL3JAcvokwaKt1e
 export const CREATE_DISCRIMINATOR = new Uint8Array([24, 30, 200, 40, 5, 28, 7, 119]);
 // create_v2: "Creates a new spl-22 coin and bonding curve"
 export const CREATE_V2_DISCRIMINATOR = new Uint8Array([214, 144, 76, 236, 95, 139, 49, 180]);
-
-export function isCreateInstruction(data) {
-  if (!data || data.length < 8) return false;
-  const disc = data.slice(0, 8);
-  return (
-    disc.every((b, i) => b === CREATE_DISCRIMINATOR[i]) ||
-    disc.every((b, i) => b === CREATE_V2_DISCRIMINATOR[i])
-  );
-}

@@ -2,18 +2,18 @@
 name = "pump-sniper"
 version = "0.1.0"
 edition = "2021"
-description = "Pump.fun token sniper - low-latency Yellowstone gRPC streaming"
-
-[[bin]]
-name = "pump-sniper"
-path = "src/main.rs"
+description = "Pump.fun new token sniper - Yellowstone gRPC + buy"
 
 [dependencies]
 anyhow = "1.0"
-bs58 = "0.5"
 dotenvy = "0.15"
 futures = "0.3"
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
-tonic = { version = "0.14", features = ["tls-ring"] }
-yellowstone-grpc-client = "12"
-yellowstone-grpc-proto = "12"
+solana-sdk = "2"
+solana-client = "2"
+tokio = { version = "1", features = ["full"] }
+yellowstone-grpc-client = "12.0"
+yellowstone-grpc-proto = "12.0"
+pumpfun = { version = "4.6", default-features = false, features = ["create-ata"] }
+spl-associated-token-account = "6"
+bs58 = "0.5"
+serde_json = "1.0"

@@ -1,277 +1,182 @@
-//! Pump.fun token sniper - low-latency Yellowstone gRPC streaming (Rust)
+//! Pump.fun Sniper - low-latency new token detection + buy (Rust port).
 //!
-//! Set in .env:
-//!   GRPC_ENDPOINT=https://api.rpcpool.com:443
-//!   GRPC_TOKEN=<your-triton-token>
+//! Uses Yellowstone gRPC for real-time new token detection and pumpfun crate for buys.
+
+mod config;
+mod detector;
+mod trader;
 
 use anyhow::Result;
-use futures::{sink::SinkExt, stream::StreamExt};
+use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
-use tokio::sync::RwLock;
-use yellowstone_grpc_client::{GeyserGrpcClient, ClientTlsConfig};
+use std::time::{Duration, Instant};
+use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof;
 use yellowstone_grpc_proto::geyser::{
-    CommitmentLevel, SubscribeRequest, SubscribeRequestFilterTransactions,
+    CommitmentLevel, SubscribeRequest, SubscribeRequestFilterTransactions, SubscribeRequestPing,
 };
 
-const PUMP_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
-const PUMP_FUN_MINT_AUTHORITY: &str = "TSLvdd1pWpHVjahSpsvCXUbgwsL3JAcvokwaKt1eokM";
+use config::Config;
+use detector::get_mint_from_update;
+use trader::{LatencyReport, Trader};
 
-// create: [24, 30, 200, 40, 5, 28, 7, 119]
-const CREATE_DISCRIMINATOR: [u8; 8] = [24, 30, 200, 40, 5, 28, 7, 119];
-// create_v2: [214, 144, 76, 236, 95, 139, 49, 180]
-const CREATE_V2_DISCRIMINATOR: [u8; 8] = [214, 144, 76, 236, 95, 139, 49, 180];
+const LATENCY_SAMPLE_SIZE: usize = 100;
+const PING_INTERVAL_SECS: u64 = 30;
 
-fn is_create_instruction(data: &[u8]) -> bool {
-    if data.len() < 8 {
-        return false;
-    }
-    let disc = &data[0..8];
-    disc == CREATE_DISCRIMINATOR || disc == CREATE_V2_DISCRIMINATOR
-}
+fn log_latencies(r: &LatencyReport) {
+    let created_ws = r
+        .created_at_ms
+        .and_then(|c| r.ws_receive_ms.checked_sub(c));
+    let ws_gettx = r.get_tx_ms.saturating_sub(r.ws_receive_ms);
+    let gettx_sent = r.tx_sent_ms.saturating_sub(r.get_tx_ms);
+    let sent_conf = r
+        .tx_confirmed_ms
+        .map(|c| c.saturating_sub(r.tx_sent_ms));
 
-/// Read account index at position N from instruction.accounts.
-/// Yellowstone may use raw [idx0, idx1, ...] or Solana wire [len, idx0, ...].
-fn get_account_index_at(accounts: &[u8], index: usize) -> Option<u8> {
-    // Try direct index first (raw format) - matches Node.js behavior
-    if index < accounts.len() {
-        return Some(accounts[index]);
-    }
-    // Fallback: shortvec format [len, idx0, idx1, ...]
-    if accounts.len() < 2 {
-        return None;
-    }
-    let len = accounts[0];
-    let offset = if len & 0x80 != 0 { 2 } else { 1 };
-    let pos = offset + index;
-    if pos < accounts.len() && index < len as usize {
-        Some(accounts[pos])
-    } else {
-        None
-    }
-}
+    let cw = created_ws.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string());
+    let sc = sent_conf.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string());
+    let ok = if r.success { "✓" } else { "✗" };
 
-/// Extract mint from SubscribeUpdateTransactionInfo (used by both Transaction and Block updates)
-fn extract_mint_from_tx_info(
-    tx_info: &yellowstone_grpc_proto::geyser::SubscribeUpdateTransactionInfo,
-    slot: u64,
-) -> Option<(String, String, u64)> {
-    let tx = tx_info.transaction.as_ref()?;
-    let meta = tx_info.meta.as_ref()?;
-
-    if meta.err.is_some() {
-        return None;
-    }
-
-    let message = tx.message.as_ref()?;
-    let mut account_keys: Vec<Vec<u8>> = message
-        .account_keys
-        .iter()
-        .map(|k: &Vec<u8>| k.clone())
-        .collect();
-    account_keys.extend(
-        meta.loaded_writable_addresses
-            .iter()
-            .map(|k: &Vec<u8>| k.clone()),
+    println!(
+        "⏱️  LATENCY {} {} | created→ws: {}ms | ws→getTx: {}ms | getTx→sent: {}ms | sent→confirmed: {}ms",
+        r.mint, ok, cw, ws_gettx, gettx_sent, sc
     );
-    account_keys.extend(
-        meta.loaded_readonly_addresses
-            .iter()
-            .map(|k: &Vec<u8>| k.clone()),
-    );
-
-    let mut all_instructions: Vec<(&[u8], &[u8])> = Vec::new();
-    for ix in &message.instructions {
-        all_instructions.push((ix.accounts.as_slice(), ix.data.as_slice()));
-    }
-    for inner in &meta.inner_instructions {
-        for ix in &inner.instructions {
-            all_instructions.push((ix.accounts.as_slice(), ix.data.as_slice()));
-        }
-    }
-
-    for (accounts, data) in all_instructions {
-        if !is_create_instruction(data) {
-            continue;
-        }
-
-        let mint_idx = get_account_index_at(accounts, 0)?;
-        let mint_key = account_keys.get(mint_idx as usize)?;
-        if mint_key.len() != 32 {
-            continue;
-        }
-
-        let mint = bs58::encode(mint_key).into_string();
-        if mint == PUMP_FUN_MINT_AUTHORITY {
-            continue;
-        }
-
-        let sig = bs58::encode(tx_info.signature.as_slice()).into_string();
-        return Some((mint, sig, slot));
-    }
-
-    None
-}
-
-/// Extract mint from Pump.fun create instruction (Transaction update)
-fn extract_mint_from_transaction(
-    tx_update: &yellowstone_grpc_proto::geyser::SubscribeUpdateTransaction,
-) -> Option<(String, String, u64)> {
-    let tx_info = tx_update.transaction.as_ref()?;
-    extract_mint_from_tx_info(tx_info, tx_update.slot)
-}
-
-/// Print mint info with created_at latency (gRPC server → client)
-async fn print_mint_info(
-    mint: &str,
-    sig: &str,
-    slot: u64,
-    arrival_ms: i64,
-    created_at_ms: Option<i64>,
-    latency_samples: &Arc<RwLock<Vec<i64>>>,
-) {
-    let latency_ms = created_at_ms.map(|created| arrival_ms - created);
-
-    println!("🪙 NEW TOKEN DETECTED");
-    println!("   Mint: {}", mint);
-    println!("   Slot: {}", slot);
-    if let Some(created) = created_at_ms {
-        println!("   Created at: {} ms", created);
-    }
-    println!("   Arrival: {} ms", arrival_ms);
-    if let Some(lat) = latency_ms {
-        println!("   Latency (arrival - created_at): {} ms", lat);
-        latency_samples.write().await.push(lat);
-        let mut samples = latency_samples.write().await;
-        if samples.len() > 100 {
-            samples.remove(0);
-        }
-        let avg = samples.iter().sum::<i64>() / samples.len().max(1) as i64;
-        println!("   Avg latency (last {}): {} ms", samples.len(), avg);
-    }
-    println!("   Transaction: {}", sig);
-    println!("   Pump.fun: https://pump.fun/{}", mint);
-    println!();
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
-
-    let endpoint = std::env::var("GRPC_ENDPOINT")
-        .unwrap_or_else(|_| "https://laserstream-mainnet-ewr.helius-rpc.com".to_string());
-    let token = std::env::var("GRPC_TOKEN").unwrap_or_default();
-
-    if token.is_empty() {
-        eprintln!("⚠️  GRPC_TOKEN not set. Get your token at https://triton.one");
+    if dotenvy::var("GRPC_TOKEN").is_err() {
+        dotenvy::from_path(std::path::Path::new("../.env")).ok();
     }
+    let config = Config::from_env()?;
 
-    println!("Connecting to: {}", endpoint);
-
-    let builder = GeyserGrpcClient::build_from_shared(endpoint.clone())?
-        .x_token(Some(token.as_str()))?
-        .max_decoding_message_size(64 * 1024 * 1024);
-
-    // Enable TLS for HTTPS endpoints
-    let mut client = if endpoint.starts_with("https://") {
-        builder.tls_config(ClientTlsConfig::new().with_native_roots())?.connect()
+    let trading_ready = Trader::init(&config).await;
+    if trading_ready {
+        println!("✅ Trader ready. Buy amount: {} SOL", config.buy_amount_sol);
     } else {
-        builder.connect()
+        println!("⚠️  PRIVATE_KEY not set. Trading disabled.");
     }
-    .await?;
 
-    let version = client.get_version().await?;
-    println!("✅ Connected to Triton gRPC, version: {:?}", version);
-    println!("🔍 Listening for new pump.fun token launches...\n");
+    println!(
+        "Connecting to: {} ({})",
+        config.grpc_endpoint,
+        config.grpc_provider.as_deref().unwrap_or("custom")
+    );
 
-    let (mut subscribe_tx, mut stream) = client.subscribe().await?;
+    let mut client = GeyserGrpcClient::build_from_shared(config.grpc_endpoint.clone())?
+        .x_token(Some(config.grpc_token.clone()))?
+        .tls_config(ClientTlsConfig::new().with_native_roots())?
+        .connect()
+        .await?;
+
+    println!("✅ Connected to gRPC");
+    println!("🔍 Listening for new pump.fun tokens...");
+    if trading_ready {
+        println!("   Trading: ENABLED");
+    } else {
+        println!("   Trading: DISABLED");
+    }
+    println!();
+
+    let (mut tx, mut stream) = client.subscribe().await?;
 
     let request = SubscribeRequest {
-        slots: HashMap::new(),
-        accounts: HashMap::new(),
         transactions: HashMap::from([(
             "pumpFun".to_string(),
             SubscribeRequestFilterTransactions {
                 vote: Some(false),
                 failed: Some(false),
-                account_include: vec![],
-                account_exclude: vec![],
                 account_required: vec![
-                    PUMP_PROGRAM_ID.to_string(),
-                    PUMP_FUN_MINT_AUTHORITY.to_string(),
+                    config::PUMP_PROGRAM_ID.to_string(),
+                    config::PUMP_FUN_MINT_AUTHORITY.to_string(),
                 ],
                 ..Default::default()
             },
         )]),
-        transactions_status: HashMap::new(),
-        entry: HashMap::new(),
-        blocks: HashMap::new(),
-        blocks_meta: HashMap::new(),
-        accounts_data_slice: vec![],
         commitment: Some(CommitmentLevel::Processed as i32),
         ..Default::default()
     };
 
-    subscribe_tx.send(request).await?;
-    println!("📡 Subscribed to pump.fun transactions (PROCESSED commitment)\n");
+    tx.send(request).await?;
+    println!("📡 Subscribed (PROCESSED commitment)\n");
 
-    let latency_samples: Arc<RwLock<Vec<i64>>> = Arc::new(RwLock::new(Vec::with_capacity(100)));
+    let trader = trading_ready.then(|| Arc::new(Trader::from_config(&config)));
+    let mut latency_samples: Vec<u64> = Vec::with_capacity(LATENCY_SAMPLE_SIZE);
+    let mut last_ping = Instant::now();
 
     while let Some(msg) = stream.next().await {
-        let arrival_ms = std::time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-
         let update = match msg {
             Ok(u) => u,
             Err(e) => {
-                eprintln!("Stream error: {e}");
+                eprintln!("Stream error: {}", e);
                 continue;
             }
         };
 
-        // created_at: when gRPC server created the message (nanosecond precision)
-        let created_at_ms = update.created_at.as_ref().map(|ts| {
-            ts.seconds * 1000 + i64::from(ts.nanos) / 1_000_000
-        });
+        if update.update_oneof.is_none() && !update.filters.is_empty() {
+            continue;
+        }
 
-        match &update.update_oneof {
-            Some(UpdateOneof::Transaction(tx_update)) => {
-                if let Some((mint, sig, slot)) = extract_mint_from_transaction(tx_update) {
-                    print_mint_info(
-                        &mint,
-                        &sig,
-                        slot,
-                        arrival_ms,
-                        created_at_ms,
-                        &latency_samples,
-                    )
-                    .await;
+        if let Some(UpdateOneof::Pong(_)) = update.update_oneof {
+            continue;
+        }
+
+        let ws_receive_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        if let Some(mint_info) = get_mint_from_update(&update) {
+            let report = if let Some(ref t) = trader {
+                t.execute_buy(&mint_info, ws_receive_ms).await
+            } else {
+                None
+            };
+
+            let latency_ms = mint_info
+                .created_at_ms
+                .and_then(|created| ws_receive_ms.checked_sub(created));
+
+            if let Some(lat) = latency_ms {
+                latency_samples.push(lat);
+                if latency_samples.len() > LATENCY_SAMPLE_SIZE {
+                    latency_samples.remove(0);
                 }
             }
-            Some(UpdateOneof::Block(block)) => {
-                for tx_info in &block.transactions {
-                    if let Some((mint, sig, slot)) =
-                        extract_mint_from_tx_info(tx_info, block.slot)
-                    {
-                        print_mint_info(
-                            &mint,
-                            &sig,
-                            slot,
-                            arrival_ms,
-                            created_at_ms,
-                            &latency_samples,
-                        )
-                        .await;
-                    }
-                }
+
+            let avg = if latency_samples.is_empty() {
+                "-".to_string()
+            } else {
+                let sum: u64 = latency_samples.iter().sum();
+                (sum / latency_samples.len() as u64).to_string()
+            };
+
+            let lat_str = latency_ms
+                .map(|l| l.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let tag = if mint_info.is_token_2022 { " [Token-2022]" } else { "" };
+            println!(
+                "🪙 {} | slot {} | gRPC {}ms (avg {}){} | https://pump.fun/{}",
+                mint_info.mint, mint_info.slot, lat_str, avg, tag, mint_info.mint
+            );
+
+            if let Some(r) = report {
+                log_latencies(&r);
             }
-            _ => {}
+        }
+
+        if last_ping.elapsed() > Duration::from_secs(PING_INTERVAL_SECS) {
+            let ping = SubscribeRequest {
+                ping: Some(SubscribeRequestPing { id: 1 }),
+                ..Default::default()
+            };
+            let _ = tx.send(ping).await;
+            last_ping = Instant::now();
         }
     }
 
+    println!("Stream ended");
     Ok(())
 }
