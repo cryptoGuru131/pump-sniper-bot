@@ -1,13 +1,5 @@
 /**
- * Pump.fun Sniper - low-latency new token detection + buy.
- *
- * Optimized for minimal response time:
- * - gRPC PROCESSED commitment for earliest detection
- * - Pre-fetched global/feeConfig at startup
- * - Fire-and-forget buy (no await in hot path)
- * - Dedupe recent mints
- *
- * .env: GRPC_ENDPOINT, GRPC_TOKEN, RPC_URL, PRIVATE_KEY, BUY_AMOUNT_SOL, SLIPPAGE_BPS
+ * Pump.fun Sniper - new token detection + buy via gRPC.
  */
 import "dotenv/config";
 import { createRequire } from "module";
@@ -20,26 +12,6 @@ import { config } from "./config.js";
 import { getMintFromUpdate } from "./detector.js";
 import { initTrader, executeBuy } from "./trader.js";
 import { PUMP_PROGRAM_ID, PUMP_FUN_MINT_AUTHORITY } from "./constants.js";
-
-const LATENCY_SAMPLE_SIZE = 100;
-const latencySamples = [];
-
-function logLatencies(r) {
-  const createdWs =
-    r.createdAtMs != null ? r.wsReceiveMs - r.createdAtMs : null;
-  const wsGetTx = r.getTxMs - r.wsReceiveMs;
-  const getTxSent = r.txSentMs - r.getTxMs;
-  const sentConf =
-    r.txConfirmedMs != null ? r.txConfirmedMs - r.txSentMs : null;
-
-  const cw = createdWs != null ? String(createdWs) : "-";
-  const sc = sentConf != null ? String(sentConf) : "-";
-  const ok = r.success ? "✓" : "✗";
-
-  console.log(
-    `⏱️  LATENCY ${r.mint} ${ok} | created→ws: ${cw}ms | ws→getTx: ${wsGetTx}ms | getTx→sent: ${getTxSent}ms | sent→confirmed: ${sc}ms`
-  );
-}
 
 async function main() {
   const tradingReady = await initTrader();
@@ -63,34 +35,10 @@ async function main() {
   stream.on("data", async (data) => {
     if (data && data.pong) return;
 
-    const wsReceiveMs = Date.now();
     const mintInfo = getMintFromUpdate(data);
-
     if (mintInfo) {
-      const report = tradingReady
-        ? await executeBuy(mintInfo, wsReceiveMs)
-        : null;
-
-      const latencyMs =
-        mintInfo.createdAtMs != null ? wsReceiveMs - mintInfo.createdAtMs : null;
-
-      if (latencyMs != null) {
-        latencySamples.push(latencyMs);
-        if (latencySamples.length > LATENCY_SAMPLE_SIZE) latencySamples.shift();
-      }
-
-      const avg =
-        latencySamples.length > 0
-          ? Math.round(
-              latencySamples.reduce((a, b) => a + b, 0) / latencySamples.length
-            )
-          : "-";
-      const tag = mintInfo.isToken2022 ? " [Token-2022]" : "";
-      console.log(
-        `🪙 ${mintInfo.mint} | slot ${mintInfo.slot} | gRPC ${latencyMs != null ? latencyMs : "-"}ms (avg ${avg})${tag} | https://pump.fun/${mintInfo.mint}`
-      );
-
-      if (report) logLatencies(report);
+      if (tradingReady) await executeBuy(mintInfo);
+      console.log(`🪙 ${mintInfo.mint} | slot ${mintInfo.slot} | https://pump.fun/${mintInfo.mint}`);
     }
   });
 

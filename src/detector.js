@@ -1,17 +1,29 @@
 /**
  * Detector - pure sync mint extraction from Yellowstone updates.
- * Zero async in hot path for minimal latency.
  */
-import bs58 from "bs58";
+import { createRequire } from "module";
+const require = createRequire(import.meta.url);
+const bs58 = require("bs58");
 import { PublicKey } from "@solana/web3.js";
 import {
-  PUMP_PROGRAM_ID,
   PUMP_FUN_MINT_AUTHORITY,
   CREATE_DISCRIMINATOR,
   CREATE_V2_DISCRIMINATOR,
 } from "./constants.js";
+import { config } from "./config.js";
 
-const ACCOUNTS_TO_INCLUDE = [{ name: "mint", index: 0 }];
+const CREATE_ACCOUNTS = [
+  { name: "mint", index: 0 },
+  { name: "bondingCurve", index: 2 },
+  { name: "associatedBondingCurve", index: 3 },
+  { name: "creator", index: 7 },
+];
+const CREATE_V2_ACCOUNTS = [
+  { name: "mint", index: 0 },
+  { name: "bondingCurve", index: 2 },
+  { name: "associatedBondingCurve", index: 3 },
+  { name: "creator", index: 5 },
+];
 const INSTRUCTION_DISCRIMINATORS = [CREATE_DISCRIMINATOR, CREATE_V2_DISCRIMINATOR];
 
 function getAccountKeys(transaction, meta) {
@@ -33,7 +45,6 @@ function getAccountKeys(transaction, meta) {
 
 function getAccountIndexAt(accounts, index) {
   if (!accounts) return null;
-  if (Array.isArray(accounts)) return index < accounts.length ? accounts[index] : null;
   return index < accounts.length ? accounts[index] : null;
 }
 
@@ -43,9 +54,10 @@ function getMatchedDiscriminatorIndex(instruction, discriminators) {
   return discriminators.findIndex((d) => Buffer.from(d).equals(Buffer.from(disc)));
 }
 
-function getAccountsByName(accountsToInclude, instruction, accountKeys) {
+function getAccountsByName(instruction, accountKeys, discIdx) {
+  const list = discIdx === 1 ? CREATE_V2_ACCOUNTS : CREATE_ACCOUNTS;
   const result = {};
-  for (const { name, index } of accountsToInclude) {
+  for (const { name, index } of list) {
     const keyIdx = getAccountIndexAt(instruction.accounts, index);
     if (keyIdx == null || keyIdx >= accountKeys.length) continue;
     const key = accountKeys[keyIdx];
@@ -54,9 +66,19 @@ function getAccountsByName(accountsToInclude, instruction, accountKeys) {
   return result;
 }
 
+function parseBlockhash(recentBlockhash) {
+  if (!recentBlockhash) return undefined;
+  const buf = Buffer.isBuffer(recentBlockhash)
+    ? recentBlockhash
+    : recentBlockhash.data
+      ? Buffer.from(recentBlockhash.data)
+      : null;
+  return buf && buf.length === 32 ? bs58.encode(buf) : undefined;
+}
+
 /**
- * Extract mint from Yellowstone SubscribeUpdate. Sync, no I/O.
- * @returns {{ mint: string, transaction: string, slot: number, isToken2022: boolean, createdAtMs: number|null } | null}
+ * Extract mint and creator from Yellowstone SubscribeUpdate. Sync, no I/O.
+ * @returns {{ mint: string, creator?: string, slot: number, associatedBondingCurve?: string, blockhash?: string } | null}
  */
 export function getMintFromUpdate(update) {
   if (!update.filters || !update.filters.includes("pumpFun")) return null;
@@ -78,20 +100,20 @@ export function getMintFromUpdate(update) {
   for (const ix of allInstructions) {
     const discIdx = getMatchedDiscriminatorIndex(ix, INSTRUCTION_DISCRIMINATORS);
     if (discIdx < 0) continue;
-    const accountsByName = getAccountsByName(ACCOUNTS_TO_INCLUDE, ix, accountKeys);
+    const accountsByName = getAccountsByName(ix, accountKeys, discIdx);
     const mint = accountsByName.mint;
     if (!mint || mint === PUMP_FUN_MINT_AUTHORITY) continue;
 
-    const isToken2022 = discIdx === 1; // CREATE_V2_DISCRIMINATOR
-    const createdAtMs =
-      update.createdAt != null ? new Date(update.createdAt).getTime() : null;
-    const sig = txInfo.signature ? bs58.encode(Buffer.from(txInfo.signature)) : "unknown";
+    const suffix = config.tokenFilterAddressSuffix;
+    if (suffix && !mint.toLowerCase().endsWith(suffix)) continue;
+
+    const blockhash = parseBlockhash(message.recentBlockhash);
     return {
       mint,
-      transaction: sig,
+      creator: accountsByName.creator || undefined,
+      associatedBondingCurve: accountsByName.associatedBondingCurve || undefined,
       slot: Number(slot),
-      isToken2022,
-      createdAtMs,
+      blockhash,
     };
   }
   return null;

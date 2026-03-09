@@ -29,6 +29,7 @@ Low-latency new token detection + auto-buy using **Triton Yellowstone gRPC** and
    PRIVATE_KEY=your-base58-private-key
    BUY_AMOUNT_SOL=0.01
    SLIPPAGE_BPS=100
+   TRADING_MODE=fast   # fast = same-block attempt; safe = poll for curve first
    ```
 
 ## Run

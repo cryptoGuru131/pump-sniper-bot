@@ -81,10 +81,22 @@ export const config = {
   },
   trading: {
     buyAmountSol: Number(process.env.BUY_AMOUNT_SOL || "0.01"),
-    slippageBps: Number(process.env.SLIPPAGE_BPS || "500"), // 5% default for sniping
+    slippageBps: Number(process.env.SLIPPAGE_BPS || "5000"), // 99% default for sniping
     enabled: process.env.TRADING_ENABLED !== "false",
+    /** Fixed token amount for local-only buy (raw units, e.g. 10_000_000 = 10M tokens) */
+    buyTokenAmount: process.env.BUY_TOKEN_AMOUNT ? BigInt(process.env.BUY_TOKEN_AMOUNT) : BigInt(400_000_000_000),
+    /** Max SOL lamports for local-only buy (derived from buyAmountSol * (1 + slippage) if not set) */
+    buyMaxSolLamports: process.env.BUY_MAX_SOL_LAMPORTS
+      ? BigInt(process.env.BUY_MAX_SOL_LAMPORTS)
+      : BigInt(10_100_000_000),
+    /** Auto-sell tokens 3s after successful buy */
+    autoSellEnabled: process.env.AUTO_SELL_ENABLED !== "false",
+    autoSellDelayMs: Number(process.env.AUTO_SELL_DELAY_MS || "10000"),
+    /** Priority fee for buy tx (SOL). ~0.001 SOL for typical 100k CU buy. */
+    buyPriorityFeeSol: Number(process.env.BUY_PRIORITY_FEE_SOL || "0.0001"),
   },
+  /** Only detect tokens whose mint address ends with this (case-insensitive). Empty = no filter. */
+  tokenFilterAddressSuffix: (process.env.TOKEN_FILTER_ADDRESS_SUFFIX || "").toLowerCase(),
 };
 
-export const TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 export const TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";

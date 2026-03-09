@@ -1,39 +1,103 @@
 /**
  * Trader - buy execution using @pump-fun/pump-sdk.
- * Pre-fetches global/feeConfig at init for minimal latency.
- * Supports Token-2022 (create_v2), bonding curve polling, latency reporting.
+ * Local-only buy: no bonding curve polling, no fetchBuyState.
+ * Uses getBuyInstructionRaw + createAssociatedTokenAccountIdempotentInstruction.
+ * Pre-fetches global at init for feeRecipient.
  */
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
 
 const BN = require("bn.js");
-const { Connection, PublicKey, Transaction } = require("@solana/web3.js");
+const {
+  Connection,
+  PublicKey,
+  Transaction,
+  TransactionInstruction,
+  ComputeBudgetProgram,
+} = require("@solana/web3.js");
 const pumpSdk = require("@pump-fun/pump-sdk");
+const {
+  createAssociatedTokenAccountIdempotentInstruction,
+  getAssociatedTokenAddressSync,
+} = require("@solana/spl-token");
 
-import {
-  config,
-  getKeypair,
-  TOKEN_PROGRAM_ID,
-  TOKEN_2022_PROGRAM_ID,
-} from "./config.js";
+import { config, getKeypair, TOKEN_2022_PROGRAM_ID } from "./config.js";
 
-const FETCH_RETRIES = 3;
-const FETCH_RETRY_MS = 50;
 const DEDUPE_MS = 5000;
-const BONDING_CURVE_POLL_MS = 40;
-const BONDING_CURVE_MAX_RETRIES = 12;
 const CONFIRM_POLL_MS = 100;
 
 let connection = null;
-let onlineSdk = null;
 let global = null;
-let feeConfig = null;
 let wallet = null;
+let onlineSdk = null;
 const recentMints = new Set();
 let lastDedupeClean = Date.now();
 
+/** Replicate SDK's getFeeRecipient (not exported). mayhemMode=false for create_v2. */
+function getFeeRecipient(globalState) {
+  const feeRecipients = [
+    globalState.feeRecipient,
+    ...(globalState.feeRecipients || []),
+  ];
+  return feeRecipients[Math.floor(Math.random() * feeRecipients.length)];
+}
+
 async function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Execute sell for tokens bought. Called after auto-sell delay.
+ * Uses sellInstructions (fetchSellState + getSellSolAmountFromTokenAmount) - no latency concern for sell.
+ * @param {{ mintAddress: string, amount: BN }}
+ */
+async function executeSell({ mintAddress, amount }) {
+  if (!wallet || !global || !connection || !onlineSdk) return;
+
+  const tokenProgram = new PublicKey(TOKEN_2022_PROGRAM_ID);
+  const mint = new PublicKey(mintAddress);
+  const user = wallet.publicKey;
+
+  const { bondingCurveAccountInfo, bondingCurve } = await onlineSdk.fetchSellState(
+    mint,
+    user,
+    tokenProgram
+  );
+
+  const solAmount = pumpSdk.getSellSolAmountFromTokenAmount({
+    global,
+    feeConfig: null,
+    mintSupply: bondingCurve.tokenTotalSupply,
+    bondingCurve,
+    amount,
+  });
+
+  const slippage = config.trading.slippageBps / 100; // e.g. 5000 -> 50
+  const instructions = await pumpSdk.PUMP_SDK.sellInstructions({
+    global,
+    bondingCurveAccountInfo,
+    bondingCurve,
+    mint,
+    user,
+    amount,
+    solAmount,
+    slippage,
+    tokenProgram,
+    mayhemMode: false,
+    cashback: bondingCurve.isCashbackCoin
+  });
+
+  const tx = new Transaction().add(...instructions);
+  const { blockhash } = await connection.getLatestBlockhash(config.rpc.commitment);
+  tx.recentBlockhash = blockhash;
+  tx.feePayer = user;
+
+  const sig = await connection.sendTransaction(tx, [wallet], {
+    skipPreflight: true,
+    preflightCommitment: config.rpc.commitment,
+    maxRetries: 3,
+  });
+  console.log(`🟢 SELL SENT ${mintAddress} | ${sig}`);
 }
 
 export async function initTrader() {
@@ -48,15 +112,23 @@ export async function initTrader() {
     commitment: config.rpc.commitment,
     confirmTransactionInitialTimeout: 15_000,
   });
-  onlineSdk = new pumpSdk.OnlinePumpSdk(connection);
 
-  const [g, fc] = await Promise.all([
-    onlineSdk.fetchGlobal(),
-    onlineSdk.fetchFeeConfig().catch(() => null),
-  ]);
-  global = g;
-  feeConfig = fc;
-  console.log("✅ Trader ready. Global pre-fetched. Buy amount:", config.trading.buyAmountSol, "SOL");
+  onlineSdk = new pumpSdk.OnlinePumpSdk(connection);
+  global = await onlineSdk.fetchGlobal();
+
+  const tokenAmt = config.trading.buyTokenAmount.toString();
+  const maxSol = config.trading.buyMaxSolLamports.toString();
+  const autoSell = config.trading.autoSellEnabled
+    ? `auto-sell ${config.trading.autoSellDelayMs}ms`
+    : "off";
+  console.log(
+    "✅ Trader ready | Token:",
+    tokenAmt,
+    "| Max SOL:",
+    maxSol,
+    "| Auto-sell:",
+    autoSell
+  );
   return true;
 }
 
@@ -69,156 +141,148 @@ function cleanDedupe() {
 }
 
 /**
- * @typedef {Object} LatencyReport
- * @property {string} mint
- * @property {number|null} createdAtMs
- * @property {number} wsReceiveMs
- * @property {number} getTxMs
- * @property {number} txSentMs
- * @property {number|null} txConfirmedMs
- * @property {boolean} success
+ * Execute buy.
+ * Uses blockhash from create tx (gRPC data) when available; no RPC fetch.
+ * @param {{ mint: string, creator?: string, associatedBondingCurve?: string, blockhash?: string }} mintInfo
+ * @returns {Promise<boolean|null>} success or null if skipped
  */
-
-/**
- * Execute buy and return latency report.
- * @param {{ mint: string, isToken2022?: boolean, createdAtMs?: number|null }} mintInfo
- * @param {number} wsReceiveMs
- * @returns {Promise<LatencyReport|null>}
- */
-export async function executeBuy(mintInfo, wsReceiveMs) {
-  if (!config.trading.enabled || !wallet || !global || !onlineSdk) return null;
+export async function executeBuy(mintInfo) {
+  if (!config.trading.enabled || !wallet || !global) return null;
 
   const mintAddress = mintInfo.mint;
-  const isToken2022 = mintInfo.isToken2022 === true;
-  const tokenProgramId = isToken2022 ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID;
-  const tokenProgram = new PublicKey(tokenProgramId);
+  const creatorAddress = mintInfo.creator;
+  if (!creatorAddress) {
+    console.warn(`⚠️ ${mintAddress} no creator in create tx, skipping local-only buy`);
+    return null;
+  }
+
+  const tokenProgram = new PublicKey(TOKEN_2022_PROGRAM_ID);
 
   cleanDedupe();
   if (recentMints.has(mintAddress)) return null;
   recentMints.add(mintAddress);
 
   const mint = new PublicKey(mintAddress);
+  const creator = new PublicKey(creatorAddress);
   const user = wallet.publicKey;
-  const solAmount = new BN(Math.floor(config.trading.buyAmountSol * 1e9));
-  const slippage = config.trading.slippageBps / 100; // SDK expects e.g. 5 for 5%
 
-  const t0 = Date.now();
+  const amount = new BN(config.trading.buyTokenAmount.toString());
+  const solAmount = new BN(config.trading.buyMaxSolLamports.toString());
+  const instructionAssociatedBondingCurve = mintInfo.associatedBondingCurve;
+  const feeRecipient = getFeeRecipient(global);
 
-  // 1. Wait for bonding curve to exist so we get correct creator
-  const bondingCurvePda = pumpSdk.bondingCurvePda(mint);
-  for (let attempt = 0; attempt < BONDING_CURVE_MAX_RETRIES; attempt++) {
-    try {
-      const info = await connection.getAccountInfo(bondingCurvePda);
-      if (info) break;
-    } catch (_) {}
-    if (attempt === BONDING_CURVE_MAX_RETRIES - 1) {
-      console.warn(
-        `⚠️ ${mintAddress} bonding curve not found after ${BONDING_CURVE_POLL_MS * BONDING_CURVE_MAX_RETRIES}ms, proceeding anyway`
-      );
-    }
-    await sleep(BONDING_CURVE_POLL_MS);
-  }
-  const t1 = Date.now();
-  const bondingCurveMs = t1 - t0;
-
-  // 2. Fetch state (bonding curve + ATA)
-  let state = null;
-  for (let i = 0; i < FETCH_RETRIES; i++) {
-    try {
-      state = await onlineSdk.fetchBuyState(mint, user, tokenProgram);
-      break;
-    } catch (e) {
-      if (i === FETCH_RETRIES - 1) {
-        console.error(`❌ Buy failed (${mintAddress}): fetchBuyState error:`, (e && e.message) || e);
-        return null;
-      }
-      await sleep(FETCH_RETRY_MS);
-    }
-  }
-  const t2 = Date.now();
-  const stateMs = t2 - t1;
-
-  // 3. Calculate amount
-  const amount = pumpSdk.getBuyTokenAmountFromSolAmount({
-    global,
-    feeConfig,
-    mintSupply: (state.bondingCurve && state.bondingCurve.tokenTotalSupply) || null,
-    bondingCurve: state.bondingCurve,
-    amount: solAmount,
-  });
-  const t3 = Date.now();
-  const amountMs = t3 - t2;
-
-  // 4. Build instructions
-  const instructions = await pumpSdk.PUMP_SDK.buyInstructions({
-    global,
-    bondingCurveAccountInfo: state.bondingCurveAccountInfo,
-    bondingCurve: state.bondingCurve,
-    associatedUserAccountInfo: state.associatedUserAccountInfo,
+  const associatedUser = getAssociatedTokenAddressSync(
     mint,
     user,
-    amount,
-    solAmount,
-    slippage,
-    tokenProgram,
-  });
-  const t4 = Date.now();
-  const instructionsMs = t4 - t3;
-
-  const getTxMs = Date.now();
-  const tx = new Transaction().add(...instructions);
-
-  console.log(
-    `⏱️  BUILD ${mintAddress} | bondingCurve: ${bondingCurveMs}ms | state: ${stateMs}ms | amount: ${amountMs}ms | instructions: ${instructionsMs}ms`
+    true,
+    tokenProgram
+  );
+  const ataIx = createAssociatedTokenAccountIdempotentInstruction(
+    user,
+    associatedUser,
+    user,
+    mint,
+    tokenProgram
   );
 
-  // sendTransaction commented out - testing tx build only
-  // let sig;
-  // try {
-  //   sig = await connection.sendTransaction(tx, [wallet], {
-  //     skipPreflight: true,
-  //     preflightCommitment: config.rpc.commitment,
-  //     maxRetries: 3,
-  //   });
-  // } catch (e) {
-  //   console.error(`❌ Buy tx failed (${mintAddress}): send:`, (e && e.message) || e);
-  //   return {
-  //     mint: mintAddress,
-  //     createdAtMs: mintInfo.createdAtMs != null ? mintInfo.createdAtMs : null,
-  //     wsReceiveMs,
-  //     getTxMs,
-  //     txSentMs: getTxMs,
-  //     txConfirmedMs: null,
-  //     success: false,
-  //   };
-  // }
-  // const txSentMs = Date.now();
-  // let txConfirmedMs = null;
-  // let success = false;
-  // for (let i = 0; i < 120; i++) {
-  //   await sleep(CONFIRM_POLL_MS);
-  //   const status = await connection.getSignatureStatus(sig);
-  //   if (status && status.value) {
-  //     txConfirmedMs = Date.now();
-  //     success = status.value.err == null;
-  //     break;
-  //   }
-  // }
-  // if (success) {
-  //   console.log(`🟢 BUY SENT ${mintAddress} | ${sig}`);
-  // } else {
-  //   console.error(`❌ Buy tx failed (${mintAddress}): ${sig}`);
-  // }
+  let buyIx = await pumpSdk.PUMP_SDK.getBuyInstructionRaw({
+    user,
+    mint,
+    creator,
+    amount,
+    solAmount,
+    feeRecipient,
+    tokenProgram,
+  });
+  const keys = [...buyIx.keys];
+  let modified = false;
+  if (instructionAssociatedBondingCurve && keys[4]) {
+    keys[4] = {
+      pubkey: new PublicKey(instructionAssociatedBondingCurve),
+      isSigner: keys[4].isSigner,
+      isWritable: keys[4].isWritable,
+    };
+    modified = true;
+  }
+  if (keys[8] && keys[8].pubkey.toBase58() !== TOKEN_2022_PROGRAM_ID) {
+    keys[8] = {
+      pubkey: new PublicKey(TOKEN_2022_PROGRAM_ID),
+      isSigner: keys[8].isSigner,
+      isWritable: keys[8].isWritable,
+    };
+    modified = true;
+  }
+  if (modified) {
+    buyIx = new TransactionInstruction({
+      programId: buyIx.programId,
+      keys,
+      data: buyIx.data,
+    });
+  }
 
-  const report = {
-    mint: mintAddress,
-    createdAtMs: mintInfo.createdAtMs != null ? mintInfo.createdAtMs : null,
-    wsReceiveMs,
-    getTxMs,
-    txSentMs: getTxMs,
-    txConfirmedMs: null,
-    success: false,
-  };
+  // Priority fee: ~0.001 SOL for typical 100k CU buy
+  const priorityFeeSol = config.trading.buyPriorityFeeSol ?? 0.001;
+  const estimatedCu = 100_000;
+  const microLamports = Math.floor((priorityFeeSol * 1e9) / estimatedCu * 1e6);
+  const priorityIx = ComputeBudgetProgram.setComputeUnitPrice({ microLamports });
 
-  return report;
+  const tx = new Transaction().add(priorityIx, ataIx, buyIx);
+  let blockhash = mintInfo.blockhash;
+  if (!blockhash) {
+    const latest = await connection.getLatestBlockhash("processed");
+    blockhash = latest.blockhash;
+  }
+  tx.recentBlockhash = blockhash;
+  tx.feePayer = user;
+
+  let sig;
+  try {
+    sig = await connection.sendTransaction(tx, [wallet], {
+      skipPreflight: true,
+      preflightCommitment: config.rpc.commitment,
+      maxRetries: 3,
+    });
+  } catch (e) {
+    console.error(
+      `❌ Buy tx failed (${mintAddress}): send:`,
+      (e && e.message) || e
+    );
+    return null;
+  }
+  let success = false;
+  for (let i = 0; i < 120; i++) {
+    await sleep(CONFIRM_POLL_MS);
+    const status = await connection.getSignatureStatus(sig);
+    if (status?.value) {
+      success = status.value.err == null;
+      break;
+    }
+  }
+  if (success) {
+    console.log(`🟢 BUY SENT ${mintAddress} | ${sig}`);
+    if (config.trading.autoSellEnabled) {
+      const delayMs = config.trading.autoSellDelayMs;
+      setTimeout(
+        () =>
+          executeSell({
+            mintAddress,
+            amount,
+          }).catch((e) =>
+            console.error(`❌ Auto-sell failed (${mintAddress}):`, (e && e.message) || e)
+          ),
+        delayMs
+      );
+    }
+  } else {
+    let errMsg = "";
+    try {
+      const txInfo = await connection.getTransaction(sig, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      });
+      if (txInfo?.meta?.err) errMsg = ` | err: ${JSON.stringify(txInfo.meta.err)}`;
+    } catch (_) {}
+    console.error(`❌ Buy failed (${mintAddress}): ${sig}${errMsg}`);
+  }
+  return success;
 }
