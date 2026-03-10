@@ -1,27 +1,24 @@
 /**
- * Trader - buy execution using @pump-fun/pump-sdk.
- * Local-only buy: no bonding curve polling, no fetchBuyState.
- * Uses getBuyInstructionRaw + createAssociatedTokenAccountIdempotentInstruction.
- * Pre-fetches global at init for feeRecipient.
+ * Pump.fun bonding curve buy/sell engine.
+ * Uses @pump-fun/pump-sdk.
+ * @module services/pumpFunBuySellEngine
  */
-import { createRequire } from "module";
-const require = createRequire(import.meta.url);
 
-const BN = require("bn.js");
-const {
+import BN from "bn.js";
+import {
   Connection,
   PublicKey,
   Transaction,
   TransactionInstruction,
   ComputeBudgetProgram,
-} = require("@solana/web3.js");
-const pumpSdk = require("@pump-fun/pump-sdk");
-const {
+} from "@solana/web3.js";
+import * as pumpSdk from "@pump-fun/pump-sdk";
+import {
   createAssociatedTokenAccountIdempotentInstruction,
   getAssociatedTokenAddressSync,
-} = require("@solana/spl-token");
+} from "@solana/spl-token";
 
-import { config, getKeypair, TOKEN_2022_PROGRAM_ID } from "./config.js";
+import { config, getKeypair, TOKEN_2022_PROGRAM_ID } from "../config/index.js";
 
 const DEDUPE_MS = 5000;
 const CONFIRM_POLL_MS = 100;
@@ -33,12 +30,8 @@ let onlineSdk = null;
 const recentMints = new Set();
 let lastDedupeClean = Date.now();
 
-/** Replicate SDK's getFeeRecipient (not exported). mayhemMode=false for create_v2. */
 function getFeeRecipient(globalState) {
-  const feeRecipients = [
-    globalState.feeRecipient,
-    ...(globalState.feeRecipients || []),
-  ];
+  const feeRecipients = [globalState.feeRecipient, ...(globalState.feeRecipients || [])];
   return feeRecipients[Math.floor(Math.random() * feeRecipients.length)];
 }
 
@@ -47,8 +40,7 @@ async function sleep(ms) {
 }
 
 /**
- * Execute sell for tokens bought. Called after auto-sell delay.
- * Uses sellInstructions (fetchSellState + getSellSolAmountFromTokenAmount) - no latency concern for sell.
+ * Execute sell for tokens bought.
  * @param {{ mintAddress: string, amount: BN }}
  */
 async function executeSell({ mintAddress, amount }) {
@@ -72,7 +64,7 @@ async function executeSell({ mintAddress, amount }) {
     amount,
   });
 
-  const slippage = config.trading.slippageBps / 100; // e.g. 5000 -> 50
+  const slippage = config.trading.slippageBps / 100;
   const instructions = await pumpSdk.PUMP_SDK.sellInstructions({
     global,
     bondingCurveAccountInfo,
@@ -84,7 +76,7 @@ async function executeSell({ mintAddress, amount }) {
     slippage,
     tokenProgram,
     mayhemMode: false,
-    cashback: bondingCurve.isCashbackCoin
+    cashback: bondingCurve.isCashbackCoin,
   });
 
   const tx = new Transaction().add(...instructions);
@@ -118,17 +110,11 @@ export async function initTrader() {
 
   const tokenAmt = config.trading.buyTokenAmount.toString();
   const maxSol = config.trading.buyMaxSolLamports.toString();
+  const delayMin = config.trading.autoSellDelayMs / 60_000;
   const autoSell = config.trading.autoSellEnabled
-    ? `auto-sell ${config.trading.autoSellDelayMs}ms`
+    ? `auto-sell ${delayMin}min (${config.trading.autoSellDelayMs}ms)`
     : "off";
-  console.log(
-    "✅ Trader ready | Token:",
-    tokenAmt,
-    "| Max SOL:",
-    maxSol,
-    "| Auto-sell:",
-    autoSell
-  );
+  console.log("✅ Trader ready | Token:", tokenAmt, "| Max SOL:", maxSol, "| Auto-sell:", autoSell);
   return true;
 }
 
@@ -142,9 +128,8 @@ function cleanDedupe() {
 
 /**
  * Execute buy.
- * Uses blockhash from create tx (gRPC data) when available; no RPC fetch.
  * @param {{ mint: string, creator?: string, associatedBondingCurve?: string, blockhash?: string }} mintInfo
- * @returns {Promise<boolean|null>} success or null if skipped
+ * @returns {Promise<boolean|null>}
  */
 export async function executeBuy(mintInfo) {
   if (!config.trading.enabled || !wallet || !global) return null;
@@ -171,12 +156,7 @@ export async function executeBuy(mintInfo) {
   const instructionAssociatedBondingCurve = mintInfo.associatedBondingCurve;
   const feeRecipient = getFeeRecipient(global);
 
-  const associatedUser = getAssociatedTokenAddressSync(
-    mint,
-    user,
-    true,
-    tokenProgram
-  );
+  const associatedUser = getAssociatedTokenAddressSync(mint, user, true, tokenProgram);
   const ataIx = createAssociatedTokenAccountIdempotentInstruction(
     user,
     associatedUser,
@@ -220,10 +200,9 @@ export async function executeBuy(mintInfo) {
     });
   }
 
-  // Priority fee: ~0.001 SOL for typical 100k CU buy
   const priorityFeeSol = config.trading.buyPriorityFeeSol ?? 0.001;
   const estimatedCu = 100_000;
-  const microLamports = Math.floor((priorityFeeSol * 1e9) / estimatedCu * 1e6);
+  const microLamports = Math.floor(((priorityFeeSol * 1e9) / estimatedCu) * 1e6);
   const priorityIx = ComputeBudgetProgram.setComputeUnitPrice({ microLamports });
 
   const tx = new Transaction().add(priorityIx, ataIx, buyIx);
@@ -243,12 +222,10 @@ export async function executeBuy(mintInfo) {
       maxRetries: 3,
     });
   } catch (e) {
-    console.error(
-      `❌ Buy tx failed (${mintAddress}): send:`,
-      (e && e.message) || e
-    );
+    console.error(`❌ Buy tx failed (${mintAddress}): send:`, e?.message ?? e);
     return null;
   }
+
   let success = false;
   for (let i = 0; i < 120; i++) {
     await sleep(CONFIRM_POLL_MS);
@@ -258,17 +235,15 @@ export async function executeBuy(mintInfo) {
       break;
     }
   }
+
   if (success) {
     console.log(`🟢 BUY SENT ${mintAddress} | ${sig}`);
     if (config.trading.autoSellEnabled) {
       const delayMs = config.trading.autoSellDelayMs;
       setTimeout(
         () =>
-          executeSell({
-            mintAddress,
-            amount,
-          }).catch((e) =>
-            console.error(`❌ Auto-sell failed (${mintAddress}):`, (e && e.message) || e)
+          executeSell({ mintAddress, amount }).catch((e) =>
+            console.error(`❌ Auto-sell failed (${mintAddress}):`, e?.message ?? e)
           ),
         delayMs
       );
@@ -281,7 +256,9 @@ export async function executeBuy(mintInfo) {
         maxSupportedTransactionVersion: 0,
       });
       if (txInfo?.meta?.err) errMsg = ` | err: ${JSON.stringify(txInfo.meta.err)}`;
-    } catch (_) {}
+    } catch {
+      /* ignore fetch error */
+    }
     console.error(`❌ Buy failed (${mintAddress}): ${sig}${errMsg}`);
   }
   return success;

@@ -1,50 +1,108 @@
 # Pump.fun Sniper
 
-Low-latency new token detection + auto-buy using **Triton Yellowstone gRPC** and **@pump-fun/pump-sdk**.
+Low-latency new token detection + auto-buy + migration alerts using **Yellowstone gRPC** and **@pump-fun/pump-sdk**.
+
+## Features
+
+- **New token detection** – create/create_v2 instructions via gRPC (PROCESSED commitment)
+- **Migration detection** – bonding curve → PumpSwap/Raydium migrations
+- **Auto-buy** – fire-and-forget buy on new token detection
+- **Optional auto-sell** – sell after configurable delay
+- **Token-2022** – full support for create_v2 and Token-2022 mints
 
 ## Requirements
 
-- **Node.js 18+** (required by dependencies)
-- Triton gRPC token
+- **Node.js 18+**
+- Triton or Helius gRPC token
 - Solana RPC endpoint
 - Wallet private key
 
-## Setup
-
-1. Install dependencies:
-   ```bash
-   npm install
-   ```
-
-2. Copy `.env.example` to `.env` and configure:
-   ```bash
-   cp .env.example .env
-   ```
-
-3. Required env vars:
-   ```
-   GRPC_ENDPOINT=https://api.rpcpool.com:443
-   GRPC_TOKEN=your-triton-grpc-token
-   RPC_URL=https://your-rpc.com/token
-   PRIVATE_KEY=your-base58-private-key
-   BUY_AMOUNT_SOL=0.01
-   SLIPPAGE_BPS=100
-   TRADING_MODE=fast   # fast = same-block attempt; safe = poll for curve first
-   ```
-
-## Run
+## Quick Start
 
 ```bash
+# Install
+npm install
+
+# Configure
+cp .env.example .env
+# Edit .env with your GRPC_TOKEN, RPC_URL, PRIVATE_KEY
+
+# Run
 npm start
-# or with auto-reload:
-npm run dev
 ```
 
-- **Detection**: Uses PROCESSED commitment for earliest possible detection (~400ms faster than WebSockets)
-- **Buy**: Automatically sends buy tx when new token is detected
-- **Latency**: Pre-fetches global/feeConfig at startup; fire-and-forget buy; skipPreflight
+## Project Structure
 
-## Rust version
+```
+pump-sniper-bot/
+├── src/
+│   ├── index.js           # Entry point
+│   ├── config/            # Configuration
+│   │   └── index.js
+│   ├── core/              # Constants
+│   │   └── constants.js
+│   ├── detectors/         # Event detection
+│   │   ├── index.js
+│   │   ├── create.js      # New token (create/create_v2)
+│   │   ├── migrate.js     # Migration events
+│   │   └── utils.js
+│   └── services/         # External integrations
+│       ├── grpc.js                  # Yellowstone gRPC client
+│       ├── pumpFunBuySellEngine.js  # Bonding curve buy/sell
+│       ├── pumpSwapBuySellEngine.js # PumpSwap buy/sell (migrated)
+│       └── index.js
+├── rust/                  # Rust port
+├── .env.example
+├── .nvmrc
+├── eslint.config.js
+├── .prettierrc
+└── package.json
+```
+
+## Configuration
+
+| Variable | Description |
+|----------|-------------|
+| `GRPC_PROVIDER` | `triton` \| `helius` |
+| `GRPC_TOKEN_TRITON` | Triton gRPC token |
+| `GRPC_TOKEN_HELIUS` | Helius gRPC token |
+| `RPC_URL` | Solana RPC for transactions |
+| `PRIVATE_KEY` | Base58 private key or path to keypair JSON |
+| `BUY_AMOUNT_SOL` | SOL per buy (default: 0.01) |
+| `SLIPPAGE_BPS` | Slippage in basis points (default: 5000) |
+| `TRADING_ENABLED` | `true` \| `false` |
+| `AUTO_SELL_ENABLED` | Auto-sell after buy |
+| `AUTO_SELL_DELAY_MS` | Delay before sell (default: 10000) |
+| `TOKEN_FILTER_ADDRESS_SUFFIX` | Only tokens whose mint ends with this |
+
+## Scripts
+
+| Script | Description |
+|--------|-------------|
+| `npm start` | Run sniper |
+| `npm run dev` | Run with nodemon |
+| `npm run fetch` | Detection only (no trading) |
+| `npm run lint` | Run ESLint |
+| `npm run format` | Format with Prettier |
+
+## Latency Optimizations
+
+- gRPC PROCESSED commitment (~400ms faster than WebSockets)
+- Pre-fetched global state at startup
+- Local-only buy (no bonding curve RPC before buy)
+- Blockhash reuse from create tx
+- `skipPreflight: true`
+- Mint deduplication
+
+## Output
+
+```
+🪙 7xKX... | slot 284521034 | https://pump.fun/7xKX...
+🟢 BUY SENT 7xKX... | 5abc...
+🚀 MIGRATED 9yAb... | slot 284521089 | https://pump.fun/9yAb...
+```
+
+## Rust Version
 
 A Rust port lives in `rust/`:
 
@@ -52,28 +110,8 @@ A Rust port lives in `rust/`:
 cd rust && cargo run --release
 ```
 
-Uses the same `.env`. See [rust/README.md](rust/README.md) for details.
+Uses the same `.env`. See [rust/README.md](rust/README.md).
 
-## Scripts
+## License
 
-| Script | Description |
-|--------|-------------|
-| `npm start` | Run sniper (detect + buy) |
-| `npm run dev` | Run with nodemon |
-| `npm run fetch` | Detection only (TRADING_ENABLED=false) |
-
-## Latency optimizations
-
-- gRPC PROCESSED commitment
-- Pre-fetched global and feeConfig at startup
-- Fire-and-forget buy (no await in hot path)
-- `skipPreflight: true` for tx send
-- Mint deduplication
-- Minimal logging in hot path
-
-## Output
-
-```
-🪙 7xKX... | slot 284521034 | gRPC 45ms (avg 52) | https://pump.fun/7xKX...
-🟢 BUY SENT 7xKX... | 5abc... | 120ms
-```
+MIT
