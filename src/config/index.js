@@ -76,6 +76,16 @@ export const config = {
     buyPriorityFeeSol: Number(process.env.BUY_PRIORITY_FEE_SOL || "0.0001"),
   },
   tokenFilterAddressSuffix: (process.env.TOKEN_FILTER_ADDRESS_SUFFIX || "").toLowerCase(),
+  /** Copy trade: wallet address to track (buy/sell detection) */
+  copyTradeWallet: (process.env.COPY_TRADE_WALLET || "").trim() || null,
+  /** Enable/disable each mode independently */
+  modes: {
+    created: process.env.CREATED_ENABLED !== "false",
+    migrated: process.env.MIGRATED_ENABLED !== "false",
+    copyTrade:
+      process.env.COPY_TRADE_ENABLED !== "false" &&
+      !!((process.env.COPY_TRADE_WALLET || "").trim()),
+  },
 };
 
 export const TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";

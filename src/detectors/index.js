@@ -5,3 +5,4 @@
 
 export { getMintFromUpdate } from "./create.js";
 export { getMigratedMintFromUpdate } from "./migrate.js";
+export { getWalletActivityFromUpdate } from "./walletActivity.js";

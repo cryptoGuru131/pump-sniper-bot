@@ -22,19 +22,42 @@ export async function createGrpcClient() {
   const version = await client.getVersion();
 
   const stream = await client.subscribe();
+
+  const { created, migrated, copyTrade } = config.modes;
+  const copyWallet = config.copyTradeWallet;
+  const transactions = {};
+  if (created || migrated) {
+    transactions.pumpFun = {
+      vote: false,
+      failed: false,
+      accountInclude: [],
+      accountExclude: [],
+      accountRequired: [PUMP_PROGRAM_ID],
+    };
+  }
+  if (copyTrade && copyWallet) {
+    transactions.copyTrade = {
+      vote: false,
+      failed: false,
+      accountInclude: [copyWallet],
+      accountExclude: [],
+      accountRequired: [PUMP_PROGRAM_ID],
+    };
+  }
+  if (Object.keys(transactions).length === 0) {
+    transactions.pumpFun = {
+      vote: false,
+      failed: false,
+      accountInclude: [],
+      accountExclude: [],
+      accountRequired: [PUMP_PROGRAM_ID],
+    };
+  }
+
   const request = {
     slots: { slots: {} },
     accounts: {},
-    transactions: {
-      pumpFun: {
-        vote: false,
-        failed: false,
-        accountInclude: [],
-        accountExclude: [],
-        // PUMP_PROGRAM_ID only: migrate txs don't include PUMP_FUN_MINT_AUTHORITY
-        accountRequired: [PUMP_PROGRAM_ID],
-      },
-    },
+    transactions,
     transactionsStatus: {},
     entry: {},
     blocks: {},

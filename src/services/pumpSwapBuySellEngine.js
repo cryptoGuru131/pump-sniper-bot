@@ -12,6 +12,7 @@ import * as pumpSdk from "@pump-fun/pump-sdk";
 import * as pumpSwapSdk from "@pump-fun/pump-swap-sdk";
 
 import { config, getKeypair } from "../config/index.js";
+import { hasPosition, setPositionOpen, setPositionClosed } from "./positionLock.js";
 
 const DEDUPE_MS = 5000;
 const CONFIRM_POLL_MS = 100;
@@ -59,6 +60,9 @@ export async function initPumpSwapTrader() {
  */
 export async function executeBuyPumpSwap(migratedInfo) {
   if (!config.trading.enabled || !wallet || !connection) return null;
+  if (hasPosition()) {
+    return null; // skip: waiting for sell before next buy
+  }
 
   const mintAddress = migratedInfo.mint;
 
@@ -127,14 +131,16 @@ export async function executeBuyPumpSwap(migratedInfo) {
   }
 
   if (success) {
+    if (config.trading.autoSellEnabled) setPositionOpen();
     console.log(`🟢 PUMPSWAP BUY SENT ${mintAddress} | ${sig}`);
     if (config.trading.autoSellEnabled) {
       const delayMs = config.trading.autoSellDelayMs;
       setTimeout(
         () =>
-          executeSellPumpSwap(mintAddress).catch((e) =>
-            console.error(`❌ PumpSwap auto-sell failed (${mintAddress}):`, e?.message ?? e)
-          ),
+          executeSellPumpSwap(mintAddress).catch((e) => {
+            console.error(`❌ PumpSwap auto-sell failed (${mintAddress}):`, e?.message ?? e);
+            setPositionClosed();
+          }),
         delayMs
       );
     }
@@ -202,4 +208,5 @@ async function executeSellPumpSwap(mintAddress) {
     maxRetries: 3,
   });
   console.log(`🟢 PUMPSWAP SELL SENT ${mintAddress} | ${sig}`);
+  setPositionClosed();
 }
